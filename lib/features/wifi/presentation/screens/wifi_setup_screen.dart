@@ -1,0 +1,704 @@
+import 'package:flutter/material.dart';
+import 'package:go_router/go_router.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:flutter_esp32_ble_wifi/core/presentation/widgets/wizard_step_layout.dart';
+import 'package:flutter_esp32_ble_wifi/core/presentation/widgets/step_error_message.dart';
+import 'package:flutter_esp32_ble_wifi/core/presentation/widgets/setup_step_indicator.dart';
+import 'package:flutter_esp32_ble_wifi/core/presentation/widgets/wifi_device_list.dart';
+import 'package:flutter_esp32_ble_wifi/features/wifi/domain/entities/wifi_network_entity.dart';
+import 'package:flutter_esp32_ble_wifi/features/wifi/presentation/providers/wifi_setup_controller.dart';
+
+Widget _buildSelectionSummary(
+  ColorScheme colorScheme,
+  String label,
+  String value, {
+  IconData icon = Icons.check_circle_rounded,
+}) {
+  return Container(
+    margin: const EdgeInsets.only(bottom: 8),
+    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+    decoration: BoxDecoration(
+      color: colorScheme.secondaryContainer.withValues(alpha: 0.3),
+      borderRadius: BorderRadius.circular(12),
+      border: Border.all(color: colorScheme.secondary.withValues(alpha: 0.1)),
+    ),
+    child: Row(
+      children: [
+        Icon(icon, size: 16, color: colorScheme.secondary),
+        const SizedBox(width: 12),
+        Text(
+          label,
+          style: TextStyle(fontSize: 12, color: colorScheme.onSurfaceVariant),
+        ),
+        const SizedBox(width: 12),
+        Flexible(
+          child: Text(
+            value,
+            style: TextStyle(
+              fontSize: 13,
+              fontWeight: FontWeight.bold,
+              color: colorScheme.secondary,
+            ),
+            overflow: TextOverflow.ellipsis,
+          ),
+        ),
+      ],
+    ),
+  );
+}
+
+class WifiSetupScreen extends ConsumerStatefulWidget {
+  const WifiSetupScreen({super.key});
+
+  @override
+  ConsumerState<WifiSetupScreen> createState() => _WifiSetupScreenState();
+}
+
+class _WifiSetupScreenState extends ConsumerState<WifiSetupScreen> {
+  final PageController _pageController = PageController();
+
+  @override
+  void dispose() {
+    _pageController.dispose();
+    super.dispose();
+  }
+
+  Future<bool> _showExitConfirmDialog() async {
+    final result = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(24)),
+        title: const Text('설정 중단'),
+        content: const Text('WiFi 설정 과정을 중단하시겠습니까?\n지금 중단하면 기기 연결이 해제됩니다.'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('계속 진행'),
+          ),
+          TextButton(
+            onPressed: () {
+              ref.read(wifiSetupControllerProvider.notifier).resetSession();
+              Navigator.pop(context, true);
+            },
+            child: Text(
+              '중단',
+              style: TextStyle(color: Theme.of(context).colorScheme.error),
+            ),
+          ),
+        ],
+      ),
+    );
+    return result ?? false;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final setupStateAsync = ref.watch(wifiSetupControllerProvider);
+    final controller = ref.read(wifiSetupControllerProvider.notifier);
+    final colorScheme = Theme.of(context).colorScheme;
+
+    ref.listen(wifiSetupControllerProvider, (prev, next) {
+      next.whenData((state) {
+        final int pageIndex = state.currentStep.index;
+        if (_pageController.hasClients &&
+            _pageController.page?.round() != pageIndex) {
+          _pageController.animateToPage(
+            pageIndex,
+            duration: const Duration(milliseconds: 500),
+            curve: Curves.fastOutSlowIn,
+          );
+        }
+      });
+    });
+
+    return PopScope(
+      canPop: false,
+      onPopInvokedWithResult: (didPop, result) async {
+        if (didPop) return;
+        final shouldPop = await _showExitConfirmDialog();
+        if (shouldPop && context.mounted) Navigator.of(context).pop();
+      },
+      child: Scaffold(
+        appBar: AppBar(
+          title: const Text(
+            'WiFi 직접 제어 설정',
+            style: TextStyle(fontWeight: FontWeight.w700),
+          ),
+          centerTitle: true,
+          leading: IconButton(
+            icon: const Icon(Icons.close_rounded),
+            onPressed: () async {
+              if (await _showExitConfirmDialog() && context.mounted) {
+                Navigator.of(context).pop();
+              }
+            },
+          ),
+          actions: [
+            setupStateAsync.maybeWhen(
+              data: (state) =>
+                  (state.currentStep == WifiSetupStep.selectDevice ||
+                      state.currentStep == WifiSetupStep.selectTargetWifi)
+                  ? (state.isScanning
+                        ? const _LoadingSpinner()
+                        : IconButton(
+                            icon: const Icon(Icons.refresh_rounded),
+                            tooltip: "다시 스캔",
+                            onPressed: state.isProcessing
+                                ? null
+                                : () => controller.scanWifi(),
+                          ))
+                  : const SizedBox.shrink(),
+              orElse: () => const SizedBox.shrink(),
+            ),
+          ],
+        ),
+        body: setupStateAsync.when(
+          data: (state) => Stack(
+            children: [
+              Column(
+                children: [
+                  if (state.currentStep != WifiSetupStep.guidelines &&
+                      state.currentStep != WifiSetupStep.success)
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(24, 16, 24, 8),
+                      child: SetupStepIndicator(
+                        currentStep: state.currentStep.index,
+                        totalSteps: 3,
+                      ),
+                    ),
+
+                  if (state.currentStep == WifiSetupStep.selectTargetWifi)
+                    Padding(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 24.0,
+                        vertical: 8,
+                      ),
+                      child: _buildSelectionSummary(
+                        colorScheme,
+                        "연결된 기기",
+                        "${state.selectedDeviceId}_Setup",
+                        icon: Icons.devices_other_rounded,
+                      ),
+                    ),
+
+                  Expanded(
+                    child: PageView(
+                      controller: _pageController,
+                      physics: const NeverScrollableScrollPhysics(),
+                      children: [
+                        _Step1Guidelines(controller: controller),
+                        _Step2SelectDevice(
+                          state: state,
+                          controller: controller,
+                        ),
+                        _Step3SelectTargetWifi(
+                          state: state,
+                          controller: controller,
+                        ),
+                        _Step4Success(state: state, controller: controller),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+              if (state.isProcessing)
+                _buildProcessingOverlay(
+                  colorScheme,
+                  state.loadingMessage,
+                  controller,
+                ),
+            ],
+          ),
+          loading: () => const Center(child: CircularProgressIndicator()),
+          error: (e, _) => Center(child: Text("오류가 발생했습니다: $e")),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildProcessingOverlay(
+    ColorScheme colorScheme,
+    String message,
+    WifiSetupController controller,
+  ) {
+    final isDeviceConnecting = message.contains("기기에 접속");
+
+    return Container(
+      color: colorScheme.scrim.withValues(alpha: 0.6),
+      child: Center(
+        child: Card(
+          elevation: 0,
+          margin: const EdgeInsets.symmetric(horizontal: 48),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(28),
+          ),
+          child: Padding(
+            padding: const EdgeInsets.all(32.0),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const CircularProgressIndicator(),
+                const SizedBox(height: 24),
+                const Text(
+                  "처리 중",
+                  style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                ),
+                const SizedBox(height: 12),
+                Text(
+                  message,
+                  style: TextStyle(
+                    fontSize: 14,
+                    color: colorScheme.onSurfaceVariant,
+                  ),
+                  textAlign: TextAlign.center,
+                ),
+
+                if (!isDeviceConnecting) ...[
+                  const SizedBox(height: 32),
+                  TextButton.icon(
+                    onPressed: () => controller.cancelProcessing(),
+                    icon: const Icon(Icons.stop_circle_outlined, size: 18),
+                    label: const Text("중단하기"),
+                    style: TextButton.styleFrom(
+                      foregroundColor: colorScheme.error,
+                    ),
+                  ),
+                ],
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _Step1Guidelines extends StatelessWidget {
+  final WifiSetupController controller;
+
+  const _Step1Guidelines({required this.controller});
+
+  @override
+  Widget build(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
+    return WizardStepLayout(
+      title: "시작 전 유의사항",
+      helpText: "성공적인 WiFi 설정을 위해 확인해 주세요.",
+      accentColor: colorScheme.secondary,
+      onNext: () => controller.startSetup(),
+      nextLabel: "시작하기",
+      child: Column(
+        children: [
+          _buildGuidelineItem(
+            colorScheme,
+            Icons.wifi_find_rounded,
+            "기기 AP 직접 접속",
+            "설정 과정 중 스마트폰이 기기가 만든 전용 WiFi(_Setup)에 자동으로 접속합니다.",
+          ),
+          _buildGuidelineItem(
+            colorScheme,
+            Icons.router_rounded,
+            "2.4GHz WiFi 지원",
+            "기기는 2.4GHz 대역의 WiFi만 지원합니다. 5GHz 네트워크는 목록에 나타나지 않을 수 있습니다.",
+          ),
+          _buildGuidelineItem(
+            colorScheme,
+            Icons.my_location_rounded,
+            "위치 서비스 활성화",
+            "주변 WiFi 스캔을 위해 위치 권한과 GPS 활성화가 필수적입니다.",
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildGuidelineItem(
+    ColorScheme colorScheme,
+    IconData icon,
+    String title,
+    String body,
+  ) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 24),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Container(
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(
+              color: colorScheme.secondaryContainer.withValues(alpha: 0.5),
+              borderRadius: BorderRadius.circular(12),
+            ),
+            child: Icon(icon, color: colorScheme.secondary, size: 24),
+          ),
+          const SizedBox(width: 20),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  title,
+                  style: const TextStyle(
+                    fontSize: 15,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  body,
+                  style: TextStyle(
+                    fontSize: 12,
+                    color: colorScheme.onSurfaceVariant,
+                    height: 1.5,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _Step2SelectDevice extends StatelessWidget {
+  final WifiSetupState state;
+  final WifiSetupController controller;
+
+  const _Step2SelectDevice({required this.state, required this.controller});
+
+  @override
+  Widget build(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
+
+    return WizardStepLayout(
+      title: "1. 기기 선택",
+      helpText: "설정할 무드등(_Setup)을 목록에서 선택하세요.",
+      accentColor: colorScheme.secondary,
+      onNext: state.selectedSsid.isNotEmpty
+          ? () => controller.connectToDevice(state.selectedSsid)
+          : null,
+      nextLabel: "기기에 연결",
+      bottom: Column(
+        children: [
+          if (state.selectedSsid.isNotEmpty)
+            _buildSelectionSummary(
+              colorScheme,
+              "선택된 기기",
+              state.selectedSsid,
+              icon: Icons.check_circle_outline_rounded,
+            ),
+          if (state.stepError != null)
+            StepErrorMessage(message: state.stepError!),
+          const SizedBox(height: 16),
+          _buildHardwareTip(colorScheme),
+        ],
+      ),
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(maxHeight: 400),
+        child: WifiDeviceList<WifiNetwork>(
+          networks: state.scanResults,
+          isScanning: state.isScanning,
+          filterDevices: true,
+          getSsid: (n) => n.ssid,
+          getRssi: (n) => n.rssi,
+          getIsSecure: (n) => n.isSecure,
+          selectedSsid: state.selectedSsid,
+          onNetworkTap: (net) => controller.selectSsid(net.ssid),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildHardwareTip(ColorScheme colorScheme) {
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: colorScheme.surfaceContainerHighest.withValues(alpha: 0.3),
+        borderRadius: BorderRadius.circular(16),
+      ),
+      child: Row(
+        children: [
+          Icon(
+            Icons.lightbulb_outline_rounded,
+            size: 20,
+            color: colorScheme.secondary,
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Text(
+              "기기가 검색되지 않으면 설정 버튼을 5초간 눌러 초기화해 주세요.",
+              style: TextStyle(
+                fontSize: 12,
+                color: colorScheme.onSurfaceVariant,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _Step3SelectTargetWifi extends ConsumerWidget {
+  final WifiSetupState state;
+  final WifiSetupController controller;
+
+  const _Step3SelectTargetWifi({required this.state, required this.controller});
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final colorScheme = Theme.of(context).colorScheme;
+    return WizardStepLayout(
+      title: "2. WiFi 선택",
+      helpText: "기기가 연결될 공유기를 선택하세요.",
+      accentColor: colorScheme.secondary,
+      bottom: Column(
+        children: [
+          if (state.stepError != null)
+            StepErrorMessage(message: state.stepError!),
+        ],
+      ),
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(maxHeight: 400),
+        child: WifiDeviceList<WifiNetwork>(
+          networks: state.scanResults,
+          isScanning: state.isScanning,
+          filterDevices: false,
+          getSsid: (n) => n.ssid,
+          getRssi: (n) => n.rssi,
+          getIsSecure: (n) => n.isSecure,
+          selectedSsid: state.selectedSsid,
+          onNetworkTap: (net) {
+            controller.onTargetWifiSelected(
+              net,
+              onRequirePassword: (ssid) {
+                _showPasswordBottomSheet(context, ref, ssid);
+              },
+            );
+          },
+        ),
+      ),
+    );
+  }
+
+  void _showPasswordBottomSheet(
+    BuildContext context,
+    WidgetRef ref,
+    String ssid,
+  ) {
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(28)),
+      ),
+      builder: (context) => _PasswordInputSheet(ssid: ssid, ref: ref),
+    );
+  }
+}
+
+class _PasswordInputSheet extends StatefulWidget {
+  final String ssid;
+  final WidgetRef ref;
+
+  const _PasswordInputSheet({required this.ssid, required this.ref});
+
+  @override
+  State<_PasswordInputSheet> createState() => _PasswordInputSheetState();
+}
+
+class _PasswordInputSheetState extends State<_PasswordInputSheet> {
+  final _controller = TextEditingController();
+  bool _obscure = true;
+
+  @override
+  Widget build(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
+    return Padding(
+      padding: EdgeInsets.fromLTRB(
+        28,
+        24,
+        28,
+        MediaQuery.of(context).viewInsets.bottom + 32,
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Row(
+            children: [
+              Container(
+                padding: const EdgeInsets.all(8),
+                decoration: BoxDecoration(
+                  color: colorScheme.secondaryContainer,
+                  shape: BoxShape.circle,
+                ),
+                child: Icon(
+                  Icons.wifi_lock_rounded,
+                  color: colorScheme.secondary,
+                  size: 20,
+                ),
+              ),
+              const SizedBox(width: 16),
+              Expanded(
+                child: Text(
+                  widget.ssid,
+                  style: const TextStyle(
+                    fontSize: 18,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 24),
+          TextField(
+            controller: _controller,
+            obscureText: _obscure,
+            autofocus: true,
+            decoration: InputDecoration(
+              labelText: "WiFi 비밀번호",
+              hintText: "비밀번호를 입력하세요",
+              border: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(12),
+              ),
+              prefixIcon: const Icon(Icons.lock_rounded),
+              suffixIcon: IconButton(
+                icon: Icon(_obscure ? Icons.visibility : Icons.visibility_off),
+                onPressed: () => setState(() => _obscure = !_obscure),
+              ),
+            ),
+          ),
+          const SizedBox(height: 32),
+          FilledButton.icon(
+            style: FilledButton.styleFrom(
+              padding: const EdgeInsets.symmetric(vertical: 18),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(16),
+              ),
+            ),
+            onPressed: () {
+              Navigator.pop(context);
+              widget.ref
+                  .read(wifiSetupControllerProvider.notifier)
+                  .completeSetup(_controller.text.trim());
+            },
+            icon: const Icon(Icons.send_rounded),
+            label: const Text(
+              "연결 및 설정 확인",
+              style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _Step4Success extends StatelessWidget {
+  final WifiSetupState state;
+  final WifiSetupController controller;
+
+  const _Step4Success({required this.state, required this.controller});
+
+  @override
+  Widget build(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
+    return WizardStepLayout(
+      title: "설정 완료!",
+      helpText: "기기가 새로운 네트워크에 성공적으로 등록되었습니다.",
+      accentColor: colorScheme.primary,
+      onNext: () => context.go('/wifi_home'),
+      nextLabel: "제어 화면으로 이동",
+      child: Column(
+        children: [
+          const SizedBox(height: 20),
+          Center(
+            child: Icon(
+              Icons.check_circle_rounded,
+              size: 100,
+              color: colorScheme.primary,
+            ),
+          ),
+          const SizedBox(height: 32),
+          const Text(
+            "모든 설정이 완료되었습니다",
+            style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+          ),
+          const SizedBox(height: 8),
+          const Text(
+            "이제 WiFi를 통해\n실시간으로 기기를 관리해 보세요.",
+            textAlign: TextAlign.center,
+            style: TextStyle(fontSize: 14, color: Colors.grey),
+          ),
+          const SizedBox(height: 40),
+          _buildInfoRow(
+            colorScheme,
+            Icons.wifi_rounded,
+            "연결된 WiFi",
+            state.selectedSsid,
+          ),
+          _buildInfoRow(
+            colorScheme,
+            Icons.router_rounded,
+            "제어 모드",
+            "로컬 네트워크 (mDNS)",
+          ),
+          const SizedBox(height: 24),
+          const Divider(),
+          const SizedBox(height: 16),
+          TextButton.icon(
+            onPressed: () => controller.resetAndRestart(),
+            icon: Icon(Icons.refresh_rounded, color: colorScheme.primary),
+            label: const Text(
+              "다른 기기 설정 또는 재설정",
+              style: TextStyle(
+                color: Colors.green,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildInfoRow(
+    ColorScheme colorScheme,
+    IconData icon,
+    String label,
+    String value,
+  ) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 12),
+      child: Row(
+        children: [
+          Icon(icon, size: 20, color: colorScheme.secondary),
+          const SizedBox(width: 16),
+          Text(label, style: TextStyle(color: colorScheme.onSurfaceVariant)),
+          const Spacer(),
+          Text(value, style: const TextStyle(fontWeight: FontWeight.bold)),
+        ],
+      ),
+    );
+  }
+}
+
+class _LoadingSpinner extends StatelessWidget {
+  const _LoadingSpinner();
+
+  @override
+  Widget build(BuildContext context) {
+    return const Center(
+      child: Padding(
+        padding: EdgeInsets.symmetric(horizontal: 16.0),
+        child: SizedBox(
+          width: 20,
+          height: 20,
+          child: CircularProgressIndicator(strokeWidth: 2),
+        ),
+      ),
+    );
+  }
+}
